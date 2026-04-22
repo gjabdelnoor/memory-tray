@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Memory Tray Monitor — shows live RAM usage in the system tray."""
 
+import os
+import subprocess
 import sys
 import threading
 import time
@@ -14,13 +16,15 @@ import pystray
 # ---------------------------------------------------------------------------
 UPDATE_INTERVAL = 2  # seconds
 ICON_SIZE = 64
-BG_COLOR = (30, 30, 30)
 TEXT_COLOR = (255, 255, 255)
 COLORS = {
     "green": (50, 205, 50),
     "yellow": (255, 215, 0),
     "red": (255, 69, 58),
 }
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+AUTOSTART_FILE = os.path.expanduser("~/.config/autostart/memory-tray.desktop")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -36,8 +40,9 @@ def get_color(percent: float):
 
 
 def create_icon(percent: float) -> Image.Image:
-    """Render a small tray icon with the percentage and a status dot."""
-    img = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), BG_COLOR)
+    """Render a small tray icon with the percentage on a colored background."""
+    bg = get_color(percent)
+    img = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), bg)
     draw = ImageDraw.Draw(img)
 
     # Try to load a font; fall back to default if unavailable
@@ -56,19 +61,38 @@ def create_icon(percent: float) -> Image.Image:
     text_h = bbox[3] - bbox[1]
     text_x = (ICON_SIZE - text_w) // 2
     text_y = (ICON_SIZE - text_h) // 2 - 2
+
+    # subtle dark outline for readability on all colors
+    outline_color = (0, 0, 0, 128)
+    for dx, dy in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
+        draw.text((text_x + dx, text_y + dy), text, fill=outline_color, font=font)
     draw.text((text_x, text_y), text, fill=TEXT_COLOR, font=font)
 
-    # Status dot on the right edge, vertically centered
-    dot_radius = 5
-    dot_x = ICON_SIZE - dot_radius - 4
-    dot_y = ICON_SIZE // 2
-    draw.ellipse(
-        [dot_x - dot_radius, dot_y - dot_radius,
-         dot_x + dot_radius, dot_y + dot_radius],
-        fill=get_color(percent)
-    )
-
     return img
+
+
+def enable_autostart():
+    os.makedirs(os.path.dirname(AUTOSTART_FILE), exist_ok=True)
+    with open(AUTOSTART_FILE, "w") as f:
+        f.write(
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=Memory Tray\n"
+            f"Exec={SCRIPT_DIR}/run.sh\n"
+            "Hidden=false\n"
+            "NoDisplay=false\n"
+            "X-GNOME-Autostart-enabled=true\n"
+        )
+    os.chmod(AUTOSTART_FILE, 0o755)
+
+
+def disable_autostart():
+    if os.path.exists(AUTOSTART_FILE):
+        os.remove(AUTOSTART_FILE)
+
+
+def autostart_status() -> str:
+    return "enabled" if os.path.exists(AUTOSTART_FILE) else "disabled"
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +111,11 @@ class MemoryTray:
         new_image = create_icon(percent)
         if self._icon:
             self._icon.icon = new_image
-            self._icon.title = f"RAM: {percent:.1f}% used ({mem.used // (1024**2)} MB / {mem.total // (1024**2)} MB)"
+            self._icon.title = (
+                f"RAM: {percent:.1f}% used "
+                f"({mem.used // (1024 ** 2)} MB / {mem.total // (1024 ** 2)} MB)\n"
+                f"Autostart: {autostart_status()}"
+            )
 
     def _loop(self):
         while self._running:
@@ -97,18 +125,38 @@ class MemoryTray:
                 print(f"Update error: {e}", file=sys.stderr)
             time.sleep(UPDATE_INTERVAL)
 
-    def _on_refresh(self, icon, item):
-        self._update()
-
-    def _on_exit(self, icon, item):
+    def _on_off(self, icon, item):
         self._running = False
         icon.stop()
+
+    def _on_autoon(self, icon, item):
+        enable_autostart()
+        self._update()
+
+    def _on_autooff(self, icon, item):
+        disable_autostart()
+        self._update()
+
+    def _on_kill(self, icon, item):
+        # Force kill this process and any sibling python processes for this script
+        try:
+            subprocess.run(
+                ["pkill", "-9", "-f", f"python3 {SCRIPT_DIR}/memory_tray.py"],
+                capture_output=True,
+            )
+        except Exception:
+            pass
+        self._running = False
+        icon.stop()
+        os._exit(1)
 
     def run(self):
         initial_percent = psutil.virtual_memory().percent
         menu = pystray.Menu(
-            pystray.MenuItem("Refresh", self._on_refresh),
-            pystray.MenuItem("Quit", self._on_exit),
+            pystray.MenuItem("off", self._on_off),
+            pystray.MenuItem("autoon", self._on_autoon),
+            pystray.MenuItem("autooff", self._on_autooff),
+            pystray.MenuItem("kill", self._on_kill),
         )
         self._icon = pystray.Icon(
             "memory-tray",
