@@ -4,17 +4,17 @@
 import os
 import subprocess
 import sys
-import threading
-import time
 
 import psutil
 from PIL import Image, ImageDraw, ImageFont
-import pystray
+from PyQt6.QtCore import QTimer
+from PyQt6.QtGui import QIcon, QImage, QPixmap
+from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-UPDATE_INTERVAL = 2  # seconds
+UPDATE_INTERVAL = 2000  # milliseconds
 ICON_SIZE = 64
 TEXT_COLOR = (255, 255, 255)
 COLORS = {
@@ -25,6 +25,7 @@ COLORS = {
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 AUTOSTART_FILE = os.path.expanduser("~/.config/autostart/memory-tray.desktop")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -45,7 +46,6 @@ def create_icon(percent: float) -> Image.Image:
     img = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), bg)
     draw = ImageDraw.Draw(img)
 
-    # Try to load a font; fall back to default if unavailable
     font_size = 20
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
@@ -69,6 +69,14 @@ def create_icon(percent: float) -> Image.Image:
     draw.text((text_x, text_y), text, fill=TEXT_COLOR, font=font)
 
     return img
+
+
+def pil_to_qicon(img: Image.Image) -> QIcon:
+    """Convert a PIL Image to a QIcon."""
+    data = img.tobytes("raw", "RGBA")
+    qimage = QImage(data, img.width, img.height, QImage.Format.Format_RGBA8888)
+    pixmap = QPixmap.fromImage(qimage)
+    return QIcon(pixmap)
 
 
 def enable_autostart():
@@ -100,45 +108,57 @@ def autostart_status() -> str:
 # ---------------------------------------------------------------------------
 
 class MemoryTray:
-    def __init__(self):
-        self._icon = None
-        self._running = True
-        self._thread = None
+    def __init__(self, app: QApplication):
+        self.app = app
+        self.tray = QSystemTrayIcon()
+        self.tray.setToolTip("Memory Tray")
 
-    def _update(self):
+        # Right-click menu
+        self.menu = QMenu()
+        self.menu.addAction("off", self.on_off)
+        self.menu.addAction("autoon", self.on_autoon)
+        self.menu.addAction("autooff", self.on_autooff)
+        self.menu.addAction("kill", self.on_kill)
+        self.tray.setContextMenu(self.menu)
+
+        # Also handle left-click activation (optional)
+        self.tray.activated.connect(self.on_activated)
+
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update)
+        self.timer.start(UPDATE_INTERVAL)
+
+        self.update()
+        self.tray.show()
+
+    def update(self):
         mem = psutil.virtual_memory()
         percent = mem.percent
-        new_image = create_icon(percent)
-        if self._icon:
-            self._icon.icon = new_image
-            self._icon.title = (
-                f"RAM: {percent:.1f}% used "
-                f"({mem.used // (1024 ** 2)} MB / {mem.total // (1024 ** 2)} MB)\n"
-                f"Autostart: {autostart_status()}"
-            )
+        img = create_icon(percent)
+        self.tray.setIcon(pil_to_qicon(img))
+        self.tray.setToolTip(
+            f"RAM: {percent:.1f}% used\n"
+            f"({mem.used // (1024 ** 2)} MB / {mem.total // (1024 ** 2)} MB)\n"
+            f"Autostart: {autostart_status()}"
+        )
 
-    def _loop(self):
-        while self._running:
-            try:
-                self._update()
-            except Exception as e:
-                print(f"Update error: {e}", file=sys.stderr)
-            time.sleep(UPDATE_INTERVAL)
+    def on_activated(self, reason: QSystemTrayIcon.ActivationReason):
+        # Left click can also trigger an action if desired
+        pass
 
-    def _on_off(self, icon, item):
-        self._running = False
-        icon.stop()
+    def on_off(self):
+        self.tray.hide()
+        self.app.quit()
 
-    def _on_autoon(self, icon, item):
+    def on_autoon(self):
         enable_autostart()
-        self._update()
+        self.update()
 
-    def _on_autooff(self, icon, item):
+    def on_autooff(self):
         disable_autostart()
-        self._update()
+        self.update()
 
-    def _on_kill(self, icon, item):
-        # Force kill this process and any sibling python processes for this script
+    def on_kill(self):
         try:
             subprocess.run(
                 ["pkill", "-9", "-f", f"python3 {SCRIPT_DIR}/memory_tray.py"],
@@ -146,29 +166,22 @@ class MemoryTray:
             )
         except Exception:
             pass
-        self._running = False
-        icon.stop()
+        self.tray.hide()
+        self.app.quit()
         os._exit(1)
 
-    def run(self):
-        initial_percent = psutil.virtual_memory().percent
-        menu = pystray.Menu(
-            pystray.MenuItem("off", self._on_off),
-            pystray.MenuItem("autoon", self._on_autoon),
-            pystray.MenuItem("autooff", self._on_autooff),
-            pystray.MenuItem("kill", self._on_kill),
-        )
-        self._icon = pystray.Icon(
-            "memory-tray",
-            icon=create_icon(initial_percent),
-            title=f"RAM: {initial_percent:.1f}% used",
-            menu=menu,
-        )
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-        self._icon.run()
+
+def main():
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        print("System tray is not available", file=sys.stderr)
+        sys.exit(1)
+
+    tray = MemoryTray(app)
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-    tray = MemoryTray()
-    tray.run()
+    main()
